@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""cctree - show Claude Code sessions of a project as a conversation tree,
+and resume / fork any of them.
+
+Forked sessions (--fork-session, /branch) copy the parent's messages with the
+same uuids, so merging all session files of a project by uuid recovers the tree.
+
+  cctree                 tree for the current directory's project
+  cctree -a              include single-prompt sessions without branches, too
+  cctree pick            fzf picker: enter = resume, ctrl-f = fork,
+                         ctrl-t = redo an earlier prompt (like e)
+  cctree r <id> [name]   claude --resume <id>
+  cctree f <id> [name]   claude --resume <id> --fork-session [-n name]
+  cctree f <id> --at N "prompt" [name]
+                         fork keeping only the first N turns of <id> (see
+                         `cctree show`), send "prompt" as the new next question,
+                         then open the fork interactively. The original session
+                         is left untouched.
+  cctree e <id> K [name] redo prompt K in a copy: opens a new session holding
+                         only the turns before prompt K, with prompt K pre-filled
+                         in the input box (like rewinding, but the original
+                         session is kept as is). No model call is made.
+  cctree show <id>       print the prompts of a session's path
+
+<id> may be any unique prefix of a session id.
+"""
+import datetime
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import uuid
+
+PROJECTS = os.path.expanduser("~/.claude/projects")
+DIM, BOLD, CYAN, YEL, RST = "\033[2m", "\033[1m", "\033[36m", "\033[33m", "\033[0m"
+if not sys.stdout.isatty() and "CCTREE_COLOR" not in os.environ and "pick" not in sys.argv:
+    DIM = BOLD = CYAN = YEL = RST = ""
+
+
+def project_dir(cwd):
+    return os.path.join(PROJECTS, re.sub(r"[^A-Za-z0-9]", "-", cwd))
+
+
+def prompt_text(o):
+    """Text of a human-typed prompt, or None for tool results / meta entries."""
+    if o.get("type") != "user" or o.get("isSidechain") or o.get("isMeta"):
+        return None
+    if o.get("origin", {}).get("kind") not in (None, "human"):
+        return None
+    c = o.get("message", {}).get("content")
+    if isinstance(c, list):
+        if any(x.get("type") == "tool_result" for x in c):
+            return None
+        c = " ".join(x.get("text", "") for x in c if x.get("type") == "text")
+    if not isinstance(c, str):
+        return None
+    c = re.sub(r"<system-reminder>.*?</system-reminder>", "", c, flags=re.S).strip()
+    if not c:
+        return None
+    m = re.search(r"<command-name>(.*?)</command-name>.*?<command-args>(.*?)</command-args>", c, re.S)
+    if m:
+        return f"{m.group(1)} {m.group(2)}".strip()
+    if c.startswith("<") and ("caveat" in c[:80] or "stdout" in c[:80]):
+        return None
+    return c
+
+
+def load(pdir):
+    parent, text, sessions, rows = {}, {}, {}, {}
+    for f in glob.glob(os.path.join(pdir, "*.jsonl")):
+        sid = os.path.basename(f)[:-6]
+        s = sessions[sid] = {"id": sid, "leaf": None, "title": None, "ai": None,
+                             "mtime": os.path.getmtime(f), "cwd": None}
+        for line in open(f, errors="replace"):
+            try:
+                o = json.loads(line)
+            except ValueError:
+                continue
+            t = o.get("type")
+            if t == "custom-title":
+                s["title"] = o.get("customTitle")
+            elif t == "ai-title":
+                s["ai"] = o.get("aiTitle")
+            u = o.get("uuid")
+            if not u or o.get("isSidechain"):
+                continue
+            parent.setdefault(u, o.get("parentUuid"))
+            rows.setdefault(u, o)
+            s["leaf"] = u
+            s["cwd"] = s["cwd"] or o.get("cwd")
+            p = prompt_text(o)
+            if p:
+                text[u] = p
+    # custom-title may live in <sid>/custom-title.json as well
+    for sid, s in sessions.items():
+        ct = os.path.join(pdir, sid, "custom-title.json")
+        if not s["title"] and os.path.exists(ct):
+            try:
+                s["title"] = json.load(open(ct)).get("customTitle") or json.load(open(ct)).get("title")
+            except (ValueError, AttributeError):
+                pass
+    for s in sessions.values():
+        chain, u, seen = [], s["leaf"], set()
+        while u and u not in seen:
+            seen.add(u)
+            if u in text:
+                chain.append(u)
+            u = parent.get(u)
+        s["prompts"] = chain[::-1]
+    return {k: v for k, v in sessions.items() if v["prompts"]}, text, parent, rows
+
+
+def build_trie(sessions):
+    root = {"kids": {}, "ends": []}
+    for s in sessions.values():
+        n = root
+        for u in s["prompts"]:
+            n = n["kids"].setdefault(u, {"kids": {}, "ends": [], "uuid": u})
+        n["ends"].append(s)
+    return root
+
+
+def newest(n):
+    return max([s["mtime"] for s in n["ends"]] + [newest(k) for k in n["kids"].values()] or [0])
+
+
+def label(s):
+    when = datetime.datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
+    name = s["title"] or s["ai"] or ""
+    return f"{CYAN}{s['id'][:8]}{RST} {BOLD}{name}{RST} {DIM}{when} · {len(s['prompts'])} prompts{RST}"
+
+
+def short(t, w=70):
+    t = " ".join(t.split())
+    return t if len(t) <= w else t[: w - 1] + "…"
+
+
+def render(root, text, show_all, out, prefix_ids=False):
+    """Append (display_line, session_id_or_None) tuples to out."""
+
+    def walk(n, indent, depth):
+        # collapse linear runs: single child, nobody ends here
+        run = [n]
+        while len(run[-1]["kids"]) == 1 and not run[-1]["ends"]:
+            run.append(next(iter(run[-1]["kids"].values())))
+        last = run[-1]
+        skipped = len(run) - 2
+        first_txt = short(text[n["uuid"]])
+        head = f"{indent}{YEL}» {first_txt}{RST}"
+        if skipped > 0:
+            head += f" {DIM}(+{skipped} more){RST}"
+        if len(run) > 1:
+            head += f"{DIM} … » {RST}{short(text[last['uuid']], 40)}"
+        out.append((head, None))
+        for s in sorted(last["ends"], key=lambda s: -s["mtime"]):
+            out.append((f"{indent}  ◆ {label(s)}", s["id"]))
+        for k in sorted(last["kids"].values(), key=newest, reverse=True):
+            walk(k, indent + "  │ ", depth + 1)
+
+    trees = sorted(root["kids"].values(), key=newest, reverse=True)
+    for t in trees:
+        branched = count_sessions(t) > 1
+        if not branched and not show_all:
+            continue
+        walk(t, "", 0)
+        out.append(("", None))
+
+
+def count_sessions(n):
+    return len(n["ends"]) + sum(count_sessions(k) for k in n["kids"].values())
+
+
+def resolve(sessions, prefix):
+    hits = [s for k, s in sessions.items() if k.startswith(prefix)]
+    if len(hits) != 1:
+        sys.exit(f"cctree: {'no' if not hits else 'ambiguous'} session matching {prefix!r}")
+    return hits[0]
+
+
+def launch(s, fork, name=None, prefill=None):
+    cmd = ["claude", "--resume", s["id"]] if s else ["claude"]
+    if fork:
+        cmd.append("--fork-session")
+    if name:
+        cmd += ["-n", name]
+    if s and s["cwd"] and os.path.isdir(s["cwd"]):
+        os.chdir(s["cwd"])
+    print(DIM + " ".join(cmd) + (" --prefill …" if prefill else "") + RST, file=sys.stderr)
+    if prefill:
+        cmd += ["--prefill", prefill]
+    os.execvp(cmd[0], cmd)
+
+
+def edit_prompt(s, k, name, text, rows, pdir):
+    """Like rewinding to prompt k in a copy: write a new session holding only the
+    turns before prompt k, then open it with prompt k pre-filled for editing."""
+    if not 1 <= k <= len(s["prompts"]):
+        sys.exit(f"cctree: prompt number must be between 1 and {len(s['prompts'])}")
+    target = s["prompts"][k - 1]
+    if k == 1:  # nothing to keep: a fresh session with the first prompt pre-filled
+        if s["cwd"] and os.path.isdir(s["cwd"]):
+            os.chdir(s["cwd"])
+        launch(None, False, name, prefill=text[target])
+    chain, u = [], rows[target].get("parentUuid")
+    while u in rows:
+        chain.append(rows[u])
+        u = rows[u].get("parentUuid")
+    new = str(uuid.uuid4())
+    with open(os.path.join(pdir, new + ".jsonl"), "w") as f:
+        for o in reversed(chain):
+            o = dict(o, sessionId=new)
+            if "session_id" in o:
+                o["session_id"] = new
+            f.write(json.dumps(o, ensure_ascii=False) + "\n")
+    launch({"id": new, "cwd": s["cwd"]}, False, name, prefill=text[target])
+
+
+def fork_at(s, n, prompt, name, parent):
+    """Fork after turn n via print mode (--resume-session-at only works with -p)."""
+    if not 1 <= n < len(s["prompts"]):
+        sys.exit(f"cctree: --at must be between 1 and {len(s['prompts']) - 1} for {s['id'][:8]}")
+    at = parent[s["prompts"][n]]  # last entry of turn n = parent of prompt n+1
+    cmd = ["claude", "-p", "--resume", s["id"], "--resume-session-at", at, "--fork-session",
+           "--output-format", "json"] + (["-n", name] if name else []) + [prompt]
+    if s["cwd"] and os.path.isdir(s["cwd"]):
+        os.chdir(s["cwd"])
+    print(f"{DIM}forking {s['id'][:8]} after turn {n} and asking in print mode…{RST}", file=sys.stderr)
+    r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    try:
+        res = json.loads(r.stdout)
+    except ValueError:
+        sys.exit(f"cctree: fork failed\n{r.stdout}{r.stderr}")
+    if res.get("is_error") or not res.get("session_id"):
+        sys.exit(f"cctree: fork failed: {res.get('result')}")
+    launch({"id": res["session_id"], "cwd": None}, False)
+
+
+def main():
+    args = sys.argv[1:]
+    show_all = "-a" in args
+    args = [a for a in args if a != "-a"]
+    pdir = project_dir(os.getcwd())
+    if not os.path.isdir(pdir):
+        sys.exit(f"cctree: no sessions for {os.getcwd()} ({pdir})")
+    sessions, text, parent, rows = load(pdir)
+    cmd = args[0] if args else "tree"
+
+    if cmd in ("r", "resume", "f", "fork"):
+        if len(args) < 2:
+            sys.exit(__doc__)
+        s = resolve(sessions, args[1])
+        if cmd.startswith("f") and len(args) > 3 and args[2] == "--at":
+            if len(args) < 5:
+                sys.exit('usage: cctree f <id> --at N "prompt" [name]')
+            fork_at(s, int(args[3]), args[4], args[5] if len(args) > 5 else None, parent)
+        launch(s, cmd.startswith("f"), args[2] if len(args) > 2 else None)
+    elif cmd in ("e", "edit"):
+        if len(args) < 3:
+            sys.exit(__doc__)
+        edit_prompt(resolve(sessions, args[1]), int(args[2]), args[3] if len(args) > 3 else None, text, rows, pdir)
+    elif cmd == "show":
+        s = resolve(sessions, args[1])
+        print(label(s))
+        for i, u in enumerate(s["prompts"], 1):
+            print(f"{DIM}{i:3}{RST} {short(text[u], 110)}")
+    elif cmd == "pick":
+        if not shutil.which("fzf"):
+            sys.exit("cctree: fzf not found")
+        lines = []
+        render(build_trie(sessions), text, True, lines)
+        feed = "\n".join(f"{sid or '-'}\t{line}" for line, sid in lines)
+        me = os.path.abspath(__file__)
+        r = subprocess.run(
+            ["fzf", "--ansi", "--no-sort", "--layout=reverse", "--delimiter=\t", "--with-nth=2",
+             "--expect=ctrl-f,ctrl-t", "--header=enter: resume · ctrl-f: fork · ctrl-t: redo an earlier prompt",
+             f"--preview=[ {{1}} != - ] && CCTREE_COLOR=1 {me} show {{1}}", "--preview-window=down,40%"],
+            input=feed, text=True, stdout=subprocess.PIPE)
+        out = r.stdout.splitlines()
+        if len(out) < 2 or out[1].startswith("-\t"):
+            return
+        s = sessions[out[1].split("\t")[0]]
+        if out[0] != "ctrl-t":
+            launch(s, out[0] == "ctrl-f")
+        # second picker: choose the prompt to redo
+        turns = "\n".join(f"{i}\t{i:3}  {short(text[u], 110)}" for i, u in enumerate(s["prompts"], 1))
+        r = subprocess.run(
+            ["fzf", "--no-sort", "--layout=reverse", "--tac", "--delimiter=\t", "--with-nth=2",
+             f"--header=fork {s['id'][:8]}: pick the prompt to redo (opens a copy right before it, prompt pre-filled)",
+             "--preview=echo {2..}", "--preview-window=down,30%,wrap"],
+            input=turns, text=True, stdout=subprocess.PIPE)
+        if r.stdout.strip():
+            edit_prompt(s, int(r.stdout.split("\t")[0]), None, text, rows, pdir)
+    else:
+        lines = []
+        render(build_trie(sessions), text, show_all, lines)
+        if not lines:
+            print("no branched sessions (use -a to list all)")
+        print("\n".join(l for l, _ in lines).rstrip())
+
+
+if __name__ == "__main__":
+    main()
